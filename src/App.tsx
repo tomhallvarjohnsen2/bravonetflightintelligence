@@ -302,9 +302,7 @@ function extractEntityIdFromPickResult(
   }
 
   const directId =
-    "id" in pickedObject
-      ? (pickedObject as { id?: unknown }).id
-      : null;
+    "id" in pickedObject ? (pickedObject as { id?: unknown }).id : null;
   if (typeof directId === "string") {
     return directId;
   }
