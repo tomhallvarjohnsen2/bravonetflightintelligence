@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as Cesium from "cesium";
 import Feature from "ol/Feature";
 import type { Coordinate } from "ol/coordinate";
 import type { FeatureLike } from "ol/Feature";
@@ -7,10 +8,9 @@ import Point from "ol/geom/Point";
 import OlMap from "ol/Map";
 import Overlay from "ol/Overlay";
 import View from "ol/View";
-import { isEmpty as isEmptyExtent } from "ol/extent";
 import TileLayer from "ol/layer/Tile";
 import VectorLayer from "ol/layer/Vector";
-import { fromLonLat } from "ol/proj";
+import { fromLonLat, transform } from "ol/proj";
 import OSM from "ol/source/OSM";
 import VectorSource from "ol/source/Vector";
 import XYZ from "ol/source/XYZ";
@@ -75,20 +75,30 @@ type SelectedFlightDetails = {
 };
 
 type MapType = "standard" | "dark" | "topo";
+type ViewMode = "2d" | "3d";
 
-const FLIGHT_FEED_URL =
-  "https://api.airplanes.live/v2/point/59.9139/10.7522/250";
+const FLIGHT_FEED_URL = "https://api.airplanes.live/v2/point/62.0/15.0/900";
 const REFRESH_INTERVAL_MS = 15000;
 const COMMERCIAL_CATEGORIES = new Set(["A2", "A3", "A4", "A5"]);
 const FLIGHT_ARROW_COLOR = "#f59e0b";
 const SELECTED_FLIGHT_ARROW_COLOR = "#fbbf24";
+const NORWAY_START_CENTER = [11.5, 64.4] as const;
+const NORWAY_START_ZOOM = 4.9;
+const NORWAY_START_3D_VIEW = {
+  destination: Cesium.Rectangle.fromDegrees(4.0, 57.4, 31.5, 71.2),
+  orientation: {
+    heading: 0,
+    pitch: Cesium.Math.toRadians(-85),
+    roll: 0,
+  },
+} as const;
 const INITIAL_LOADER_MESSAGES = [
   "Connecting to flight data source",
   "Synchronizing live ADS-B positions",
   "Filtering commercial traffic",
   "Rendering aircraft on the map",
   "Correlating transponder signals",
-  "Projecting live tracks into map coordinates",
+  "Projecting live tracks into map",
   "Indexing nearby aircraft movements",
   "Finalizing the first tactical air picture",
 ] as const;
@@ -96,36 +106,7 @@ let primedFlightsPromise: Promise<Aircraft[]> | null = null;
 
 const createPlaneIconDataUrl = (fillColor: string) => {
   const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 44 44">
-      <path
-        fill="${fillColor}"
-        d="M22 4
-           C20.8 4 19.9 4.9 19.9 6.1
-           V14.4
-           L10.8 19
-           C9.9 19.5 9.4 20.5 9.6 21.5
-           C9.8 22.6 10.8 23.4 11.9 23.4
-           H19.9
-           V28.1
-           L15.7 31.1
-           V35.2
-           L19.9 33.5
-           V38.3
-           C19.9 39.5 20.8 40.4 22 40.4
-           C23.2 40.4 24.1 39.5 24.1 38.3
-           V33.5
-           L28.3 35.2
-           V31.1
-           L24.1 28.1
-           V23.4
-           H32.1
-           C33.2 23.4 34.2 22.6 34.4 21.5
-           C34.6 20.5 34.1 19.5 33.2 19
-           L24.1 14.4
-           V6.1
-           C24.1 4.9 23.2 4 22 4Z"
-      />
-    </svg>
+    <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="${fillColor}"><path d="M280-80v-100l120-84v-144L80-280v-120l320-224v-176q0-33 23.5-56.5T480-880q33 0 56.5 23.5T560-800v176l320 224v120L560-408v144l120 84v100l-200-60-200 60Z"/></svg>
   `;
 
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
@@ -147,6 +128,33 @@ function BravoNetLogo() {
       </div>
     </div>
   );
+}
+
+function altitudeFeetToMeters(altitude: Aircraft["alt_baro"]) {
+  return typeof altitude === "number" ? Math.max(0, altitude * 0.3048) : 0;
+}
+
+function createCesiumImageryProvider(mapType: MapType) {
+  if (mapType === "dark") {
+    return new Cesium.UrlTemplateImageryProvider({
+      credit: "OpenStreetMap contributors, CARTO",
+      subdomains: ["a", "b", "c", "d"],
+      url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+    });
+  }
+
+  if (mapType === "topo") {
+    return new Cesium.UrlTemplateImageryProvider({
+      credit: "OpenTopoMap contributors",
+      subdomains: ["a", "b", "c"],
+      url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+    });
+  }
+
+  return new Cesium.OpenStreetMapImageryProvider({
+    credit: "OpenStreetMap contributors",
+    url: "https://tile.openstreetmap.org/",
+  });
 }
 
 function createBaseSource(mapType: MapType) {
@@ -215,7 +223,12 @@ if (typeof window !== "undefined") {
 
 function createFlightFeature(aircraft: Aircraft) {
   const callsign = aircraft.flight?.trim() ?? aircraft.hex;
-  const coordinate = fromLonLat([aircraft.lon!, aircraft.lat!]);
+  const altitudeMeters = altitudeFeetToMeters(aircraft.alt_baro);
+  const coordinate = transform(
+    [aircraft.lon!, aircraft.lat!, altitudeMeters],
+    "EPSG:4326",
+    "EPSG:3857",
+  );
 
   const feature = new Feature({
     geometry: new Point(coordinate),
@@ -227,15 +240,105 @@ function createFlightFeature(aircraft: Aircraft) {
       typeof aircraft.alt_baro === "number"
         ? `${Math.round(aircraft.alt_baro).toLocaleString("nb-NO")} ft`
         : "Unknown",
+    altitudeMeters,
     callsign,
     position: coordinate,
     registration: aircraft.r ?? "Unknown",
-    speed: typeof aircraft.gs === "number" ? `${Math.round(aircraft.gs)} kt` : "Unknown",
+    speed:
+      typeof aircraft.gs === "number"
+        ? `${Math.round(aircraft.gs)} kt`
+        : "Unknown",
     track: aircraft.track ?? 0,
     type: aircraft.desc ?? aircraft.t ?? "Unknown aircraft type",
   });
 
   return feature;
+}
+
+function buildSelectedFlightDetailsFromAircraft(
+  aircraft: Aircraft,
+): SelectedFlightDetails {
+  const altitudeMeters = altitudeFeetToMeters(aircraft.alt_baro);
+
+  return {
+    altitude:
+      typeof aircraft.alt_baro === "number"
+        ? `${Math.round(aircraft.alt_baro).toLocaleString("nb-NO")} ft`
+        : "Unknown",
+    callsign: aircraft.flight?.trim() ?? aircraft.hex,
+    hex: aircraft.hex,
+    position: transform(
+      [aircraft.lon!, aircraft.lat!, altitudeMeters],
+      "EPSG:4326",
+      "EPSG:3857",
+    ),
+    registration: aircraft.r ?? "Unknown",
+    speed:
+      typeof aircraft.gs === "number"
+        ? `${Math.round(aircraft.gs)} kt`
+        : "Unknown",
+    track: aircraft.track ?? 0,
+    type: aircraft.desc ?? aircraft.t ?? "Unknown aircraft type",
+  };
+}
+
+function extractFlightHexFromEntityId(entityId: string) {
+  if (entityId.startsWith("flight-stem-")) {
+    return entityId.slice("flight-stem-".length);
+  }
+
+  if (entityId.startsWith("flight-")) {
+    return entityId.slice("flight-".length);
+  }
+
+  return null;
+}
+
+function extractEntityIdFromPickResult(
+  pickedObject: Cesium.Scene | Cesium.Cesium3DTileFeature | unknown,
+) {
+  if (!pickedObject || typeof pickedObject !== "object") {
+    return null;
+  }
+
+  const directId =
+    "id" in pickedObject
+      ? (pickedObject as { id?: unknown }).id
+      : null;
+  if (typeof directId === "string") {
+    return directId;
+  }
+  if (
+    directId &&
+    typeof directId === "object" &&
+    "id" in directId &&
+    typeof (directId as { id?: unknown }).id === "string"
+  ) {
+    return (directId as { id: string }).id;
+  }
+
+  const primitive =
+    "primitive" in pickedObject
+      ? (pickedObject as { primitive?: unknown }).primitive
+      : null;
+  if (!primitive || typeof primitive !== "object" || !("id" in primitive)) {
+    return null;
+  }
+
+  const primitiveId = (primitive as { id?: unknown }).id;
+  if (typeof primitiveId === "string") {
+    return primitiveId;
+  }
+  if (
+    primitiveId &&
+    typeof primitiveId === "object" &&
+    "id" in primitiveId &&
+    typeof (primitiveId as { id?: unknown }).id === "string"
+  ) {
+    return (primitiveId as { id: string }).id;
+  }
+
+  return null;
 }
 
 function buildSelectedFlightDetails(feature: Feature): SelectedFlightDetails {
@@ -268,22 +371,28 @@ function getRouteFieldValue(
 
 function App() {
   const mapElementRef = useRef<HTMLDivElement | null>(null);
+  const cesiumElementRef = useRef<HTMLDivElement | null>(null);
   const popupElementRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<OlMap | null>(null);
+  const cesiumViewerRef = useRef<Cesium.Viewer | null>(null);
+  const latestFlightsRef = useRef<Aircraft[]>([]);
   const popupOverlayRef = useRef<Overlay | null>(null);
   const baseLayerRef = useRef<TileLayer | null>(null);
   const flightsLayerRef = useRef<VectorLayer<VectorSource> | null>(null);
   const flightsSourceRef = useRef<VectorSource | null>(null);
-  const hasAutoFittedRef = useRef(false);
   const isRefreshingRef = useRef(false);
   const selectedFlightHexRef = useRef<string | null>(null);
   const styleCacheRef = useRef(new globalThis.Map<string, Style[]>());
-  const [flightCount, setFlightCount] = useState(0);
   const [mapType, setMapType] = useState<MapType>("dark");
+  const [viewMode, setViewMode] = useState<ViewMode>("3d");
   const [isInitialFlightLoad, setIsInitialFlightLoad] = useState(true);
   const [loaderMessageIndex, setLoaderMessageIndex] = useState(0);
   const [selectedFlight, setSelectedFlight] =
     useState<SelectedFlightDetails | null>(null);
+  const [cesiumPopupPosition, setCesiumPopupPosition] = useState<{
+    left: number;
+    top: number;
+  } | null>(null);
   const [routeInfoState, setRouteInfoState] = useState<RouteInfoState>({
     status: "idle",
   });
@@ -296,12 +405,233 @@ function App() {
     ],
     [],
   );
+  const viewModeOptions = useMemo(
+    () => [
+      { label: "2D", value: "2d" as const },
+      { label: "3D", value: "3d" as const },
+    ],
+    [],
+  );
+  const is3DMode = viewMode === "3d";
+  const routeMessage =
+    routeInfoState.status === "missing" || routeInfoState.status === "error"
+      ? routeInfoState.message
+      : null;
+
+  const renderFlightPopupContent = useCallback(() => {
+    if (!selectedFlight) {
+      return null;
+    }
+
+    return (
+      <>
+        <button
+          type="button"
+          className="flight-popup__close"
+          onClick={() => {
+            setSelectedFlight(null);
+          }}
+          aria-label="Close popup"
+        >
+          x
+        </button>
+
+        <div className="flight-popup__header">
+          <h3>{selectedFlight.callsign}</h3>
+          <p>{selectedFlight.registration}</p>
+        </div>
+
+        <div className="flight-popup__details">
+          <div className="flight-popup__row flight-popup__row--route">
+            <div className="flight-popup__detail">
+              <span>From</span>
+              <strong>{getRouteFieldValue(routeInfoState, "origin")}</strong>
+            </div>
+            <div className="flight-popup__detail">
+              <span>To</span>
+              <strong>
+                {getRouteFieldValue(routeInfoState, "destination")}
+              </strong>
+            </div>
+          </div>
+
+          <div className="flight-popup__row flight-popup__row--metrics">
+            <div className="flight-popup__detail">
+              <span>Altitude</span>
+              <strong>{selectedFlight.altitude}</strong>
+            </div>
+            <div className="flight-popup__detail">
+              <span>Speed</span>
+              <strong>{selectedFlight.speed}</strong>
+            </div>
+            <div className="flight-popup__detail">
+              <span>Heading</span>
+              <strong>{Math.round(selectedFlight.track)} deg</strong>
+            </div>
+          </div>
+        </div>
+
+        {routeMessage ? (
+          <p className="flight-popup__route-note">{routeMessage}</p>
+        ) : null}
+      </>
+    );
+  }, [routeInfoState, routeMessage, selectedFlight]);
+
+  const applyCesiumBaseLayer = useCallback((nextMapType: MapType) => {
+    const viewer = cesiumViewerRef.current;
+    if (!viewer) {
+      return;
+    }
+
+    viewer.imageryLayers.removeAll();
+    viewer.imageryLayers.addImageryProvider(
+      createCesiumImageryProvider(nextMapType),
+    );
+    viewer.scene.requestRender();
+  }, []);
+
+  const syncCesiumFlights = useCallback((flights: Aircraft[]) => {
+    const viewer = cesiumViewerRef.current;
+    if (!viewer) {
+      return;
+    }
+
+    const selectedHex = selectedFlightHexRef.current;
+    const activeEntityIds = new Set<string>();
+
+    for (const aircraft of flights) {
+      const altitudeMeters = altitudeFeetToMeters(aircraft.alt_baro);
+      const callsign = aircraft.flight?.trim() ?? aircraft.hex;
+      const track = aircraft.track ?? 0;
+      const isSelected = aircraft.hex === selectedHex;
+      const aircraftEntityId = `flight-${aircraft.hex}`;
+      const stemEntityId = `flight-stem-${aircraft.hex}`;
+      const position = Cesium.Cartesian3.fromDegrees(
+        aircraft.lon!,
+        aircraft.lat!,
+        altitudeMeters,
+      );
+      const stemPositions = Cesium.Cartesian3.fromDegreesArrayHeights([
+        aircraft.lon!,
+        aircraft.lat!,
+        0,
+        aircraft.lon!,
+        aircraft.lat!,
+        altitudeMeters,
+      ]);
+      const aircraftEntity = viewer.entities.getById(aircraftEntityId);
+      const stemEntity = viewer.entities.getById(stemEntityId);
+      const imageSource = createPlaneIconDataUrl(
+        isSelected ? SELECTED_FLIGHT_ARROW_COLOR : FLIGHT_ARROW_COLOR,
+      );
+
+      if (aircraftEntity) {
+        aircraftEntity.position = new Cesium.ConstantPositionProperty(position);
+        if (aircraftEntity.billboard) {
+          aircraftEntity.billboard.image = new Cesium.ConstantProperty(
+            imageSource,
+          );
+          aircraftEntity.billboard.rotation = new Cesium.ConstantProperty(
+            (track * Math.PI) / 180,
+          );
+          aircraftEntity.billboard.scale = new Cesium.ConstantProperty(
+            isSelected ? 1.08 : 0.96,
+          );
+        }
+        if (aircraftEntity.label) {
+          aircraftEntity.label.text = new Cesium.ConstantProperty(callsign);
+          aircraftEntity.label.backgroundColor = new Cesium.ConstantProperty(
+            isSelected
+              ? Cesium.Color.fromCssColorString("rgba(15, 23, 42, 0.95)")
+              : Cesium.Color.fromCssColorString("rgba(15, 23, 42, 0.82)"),
+          );
+        }
+      } else {
+        viewer.entities.add({
+          billboard: {
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            image: imageSource,
+            rotation: (track * Math.PI) / 180,
+            scale: isSelected ? 1.08 : 0.96,
+            verticalOrigin: Cesium.VerticalOrigin.CENTER,
+          },
+          id: aircraftEntityId,
+          label: {
+            backgroundColor: isSelected
+              ? Cesium.Color.fromCssColorString("rgba(15, 23, 42, 0.95)")
+              : Cesium.Color.fromCssColorString("rgba(15, 23, 42, 0.82)"),
+            fillColor: Cesium.Color.WHITE,
+            font: "600 14px Inter, system-ui, sans-serif",
+            pixelOffset: new Cesium.Cartesian2(0, 26),
+            show: true,
+            showBackground: true,
+            style: Cesium.LabelStyle.FILL,
+            text: callsign,
+          },
+          position,
+        });
+      }
+
+      if (stemEntity) {
+        if (stemEntity.polyline) {
+          stemEntity.polyline.positions = new Cesium.ConstantProperty(
+            stemPositions,
+          );
+          stemEntity.polyline.material = new Cesium.ColorMaterialProperty(
+            isSelected
+              ? Cesium.Color.fromCssColorString("rgba(251, 191, 36, 0.9)")
+              : Cesium.Color.fromCssColorString("rgba(148, 163, 184, 0.55)"),
+          );
+          stemEntity.polyline.width = new Cesium.ConstantProperty(
+            isSelected ? 3.2 : 1.6,
+          );
+        }
+      } else {
+        viewer.entities.add({
+          id: stemEntityId,
+          polyline: {
+            material: new Cesium.ColorMaterialProperty(
+              isSelected
+                ? Cesium.Color.fromCssColorString("rgba(251, 191, 36, 0.9)")
+                : Cesium.Color.fromCssColorString("rgba(148, 163, 184, 0.55)"),
+            ),
+            positions: stemPositions,
+            width: isSelected ? 3.2 : 1.6,
+          },
+        });
+      }
+
+      activeEntityIds.add(aircraftEntityId);
+      activeEntityIds.add(stemEntityId);
+    }
+
+    const staleEntities: Cesium.Entity[] = [];
+    viewer.entities.values.forEach((entity) => {
+      if (
+        typeof entity.id === "string" &&
+        entity.id.startsWith("flight") &&
+        !activeEntityIds.has(entity.id)
+      ) {
+        staleEntities.push(entity);
+      }
+    });
+
+    staleEntities.forEach((entity) => {
+      viewer.entities.remove(entity);
+    });
+    viewer.scene.requestRender();
+  }, []);
 
   useEffect(() => {
     selectedFlightHexRef.current = selectedFlight?.hex ?? null;
     popupOverlayRef.current?.setPosition(selectedFlight?.position);
     flightsLayerRef.current?.changed();
-  }, [selectedFlight]);
+    syncCesiumFlights(latestFlightsRef.current);
+    if (!selectedFlight || !is3DMode) {
+      setCesiumPopupPosition(null);
+    }
+  }, [is3DMode, selectedFlight, syncCesiumFlights]);
 
   useEffect(() => {
     if (!isInitialFlightLoad) {
@@ -476,8 +806,8 @@ function App() {
         controls: defaultControls({ zoom: false }),
         layers: [baseLayerRef.current, flightsLayerRef.current],
         view: new View({
-          center: fromLonLat([10.7522, 59.9139]),
-          zoom: 5,
+          center: fromLonLat([...NORWAY_START_CENTER]),
+          zoom: NORWAY_START_ZOOM,
         }),
       });
     }
@@ -530,12 +860,160 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!cesiumElementRef.current || cesiumViewerRef.current) {
+      return;
+    }
+
+    const viewer = new Cesium.Viewer(cesiumElementRef.current, {
+      animation: false,
+      baseLayerPicker: false,
+      fullscreenButton: false,
+      geocoder: false,
+      homeButton: false,
+      infoBox: false,
+      navigationHelpButton: false,
+      sceneModePicker: false,
+      selectionIndicator: false,
+      shouldAnimate: false,
+      timeline: false,
+    });
+    viewer.scene.globe.enableLighting = true;
+    viewer.scene.requestRenderMode = true;
+    viewer.scene.screenSpaceCameraController.enableCollisionDetection = false;
+    cesiumViewerRef.current = viewer;
+    applyCesiumBaseLayer(mapType);
+
+    return () => {
+      viewer.destroy();
+      cesiumViewerRef.current = null;
+    };
+  }, [applyCesiumBaseLayer, mapType]);
+
+  useEffect(() => {
+    const viewer = cesiumViewerRef.current;
+    if (!viewer) {
+      return;
+    }
+
+    const clickHandler = new Cesium.ScreenSpaceEventHandler(
+      viewer.scene.canvas,
+    );
+
+    const handleCesiumClick = (event: { position: Cesium.Cartesian2 }) => {
+      if (!is3DMode) {
+        return;
+      }
+
+      const pickedObject = viewer.scene.pick(event.position);
+      const entityId = extractEntityIdFromPickResult(pickedObject);
+
+      if (!entityId) {
+        setSelectedFlight(null);
+        viewer.scene.requestRender();
+        return;
+      }
+
+      const selectedHex = extractFlightHexFromEntityId(entityId);
+      if (!selectedHex) {
+        setSelectedFlight(null);
+        viewer.scene.requestRender();
+        return;
+      }
+
+      const aircraft = latestFlightsRef.current.find(
+        (flight) => flight.hex === selectedHex,
+      );
+      if (!aircraft) {
+        setSelectedFlight(null);
+        viewer.scene.requestRender();
+        return;
+      }
+
+      setSelectedFlight(buildSelectedFlightDetailsFromAircraft(aircraft));
+      viewer.scene.requestRender();
+    };
+
+    clickHandler.setInputAction(
+      handleCesiumClick,
+      Cesium.ScreenSpaceEventType.LEFT_CLICK,
+    );
+
+    return () => {
+      clickHandler.destroy();
+    };
+  }, [is3DMode]);
+
+  useEffect(() => {
+    const viewer = cesiumViewerRef.current;
+    if (!viewer || !is3DMode || !selectedFlight) {
+      return;
+    }
+
+    const updatePopupPosition = () => {
+      const aircraft = latestFlightsRef.current.find(
+        (flight) => flight.hex === selectedFlight.hex,
+      );
+      if (!aircraft) {
+        setCesiumPopupPosition(null);
+        return;
+      }
+
+      const cartesian = Cesium.Cartesian3.fromDegrees(
+        aircraft.lon!,
+        aircraft.lat!,
+        altitudeFeetToMeters(aircraft.alt_baro),
+      );
+      const coordinates = Cesium.SceneTransforms.worldToWindowCoordinates(
+        viewer.scene,
+        cartesian,
+      );
+
+      if (!coordinates) {
+        setCesiumPopupPosition(null);
+        return;
+      }
+
+      setCesiumPopupPosition({
+        left: coordinates.x + 28,
+        top: coordinates.y - 16,
+      });
+    };
+
+    updatePopupPosition();
+    viewer.scene.postRender.addEventListener(updatePopupPosition);
+
+    return () => {
+      viewer.scene.postRender.removeEventListener(updatePopupPosition);
+    };
+  }, [is3DMode, selectedFlight]);
+
+  useEffect(() => {
     if (!baseLayerRef.current) {
       return;
     }
 
     baseLayerRef.current.setSource(createBaseSource(mapType));
-  }, [mapType]);
+    applyCesiumBaseLayer(mapType);
+  }, [applyCesiumBaseLayer, mapType]);
+
+  useEffect(() => {
+    if (!mapRef.current || !cesiumViewerRef.current) {
+      return;
+    }
+
+    if (!is3DMode) {
+      mapRef.current.updateSize();
+      return;
+    }
+
+    setSelectedFlight(null);
+    cesiumViewerRef.current.camera.flyTo({
+      destination: NORWAY_START_3D_VIEW.destination,
+      duration: 0.9,
+      orientation: NORWAY_START_3D_VIEW.orientation,
+    });
+    syncCesiumFlights(latestFlightsRef.current);
+  }, [is3DMode, syncCesiumFlights]);
 
   useEffect(() => {
     if (!flightsSourceRef.current) {
@@ -556,6 +1034,7 @@ function App() {
           ? await getPrimedFlightsPromise()
           : await fetchCommercialFlights();
         const features = flights.map(createFlightFeature);
+        latestFlightsRef.current = flights;
 
         if (isCancelled || !flightsSourceRef.current) {
           return;
@@ -563,21 +1042,7 @@ function App() {
 
         flightsSourceRef.current.clear(true);
         flightsSourceRef.current.addFeatures(features);
-        const extent = flightsSourceRef.current.getExtent();
-
-        if (
-          !hasAutoFittedRef.current &&
-          mapRef.current &&
-          features.length > 0 &&
-          extent &&
-          !isEmptyExtent(extent)
-        ) {
-          mapRef.current.getView().fit(extent, {
-            padding: [110, 40, 40, 40],
-            maxZoom: 6,
-          });
-          hasAutoFittedRef.current = true;
-        }
+        syncCesiumFlights(flights);
 
         const selectedHex = selectedFlightHexRef.current;
         if (selectedHex) {
@@ -593,7 +1058,6 @@ function App() {
           }
         }
 
-        setFlightCount(features.length);
         setIsInitialFlightLoad(false);
         flightsLayerRef.current?.changed();
       } catch {
@@ -615,12 +1079,7 @@ function App() {
       isCancelled = true;
       window.clearInterval(intervalId);
     };
-  }, []);
-
-  const routeMessage =
-    routeInfoState.status === "missing" || routeInfoState.status === "error"
-      ? routeInfoState.message
-      : null;
+  }, [syncCesiumFlights]);
 
   return (
     <main className="app-shell">
@@ -629,11 +1088,6 @@ function App() {
           <BravoNetLogo />
 
           <div className="topbar__controls">
-            <div className="flight-pill">
-              <span>Flights on map</span>
-              <strong>{flightCount}</strong>
-            </div>
-
             <label className="map-type-switcher">
               <span>Map type</span>
               <select
@@ -643,6 +1097,22 @@ function App() {
                 }}
               >
                 {mapTypeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="view-mode-switcher">
+              <span>View</span>
+              <select
+                value={viewMode}
+                onChange={(event) => {
+                  setViewMode(event.target.value as ViewMode);
+                }}
+              >
+                {viewModeOptions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>
@@ -670,68 +1140,43 @@ function App() {
 
         <div
           ref={mapElementRef}
-          className="map"
+          className={`map ${is3DMode ? "map--hidden" : ""}`}
           role="region"
           aria-label="Map with commercial flight positions"
         />
 
         <div
+          ref={cesiumElementRef}
+          className={`map map--cesium ${is3DMode ? "is-active" : ""}`}
+          role="region"
+          aria-label="3D map with commercial flight positions"
+        />
+
+        <div
           ref={popupElementRef}
-          className={`flight-popup ${selectedFlight ? "is-open" : ""}`}
+          className={`flight-popup ${selectedFlight && !is3DMode ? "is-open" : ""}`}
           role="dialog"
           aria-label="Selected flight details"
         >
-          {selectedFlight ? (
-            <>
-              <button
-                type="button"
-                className="flight-popup__close"
-                onClick={() => {
-                  setSelectedFlight(null);
-                }}
-                aria-label="Close popup"
-              >
-                x
-              </button>
+          {renderFlightPopupContent()}
+        </div>
 
-              <div className="flight-popup__header">
-                <h3>{selectedFlight.callsign}</h3>
-                <p>{selectedFlight.registration}</p>
-              </div>
-
-              <div className="flight-popup__details">
-                <div className="flight-popup__row flight-popup__row--route">
-                  <div className="flight-popup__detail">
-                    <span>From</span>
-                    <strong>{getRouteFieldValue(routeInfoState, "origin")}</strong>
-                  </div>
-                  <div className="flight-popup__detail">
-                    <span>To</span>
-                    <strong>{getRouteFieldValue(routeInfoState, "destination")}</strong>
-                  </div>
-                </div>
-
-                <div className="flight-popup__row flight-popup__row--metrics">
-                  <div className="flight-popup__detail">
-                    <span>Altitude</span>
-                    <strong>{selectedFlight.altitude}</strong>
-                  </div>
-                  <div className="flight-popup__detail">
-                    <span>Speed</span>
-                    <strong>{selectedFlight.speed}</strong>
-                  </div>
-                  <div className="flight-popup__detail">
-                    <span>Heading</span>
-                    <strong>{Math.round(selectedFlight.track)} deg</strong>
-                  </div>
-                </div>
-              </div>
-
-              {routeMessage ? (
-                <p className="flight-popup__route-note">{routeMessage}</p>
-              ) : null}
-            </>
-          ) : null}
+        <div
+          className={`flight-popup flight-popup--floating ${
+            selectedFlight && is3DMode && cesiumPopupPosition ? "is-open" : ""
+          }`}
+          style={
+            cesiumPopupPosition
+              ? {
+                  left: `${cesiumPopupPosition.left}px`,
+                  top: `${cesiumPopupPosition.top}px`,
+                }
+              : undefined
+          }
+          role="dialog"
+          aria-label="Selected flight details in 3D"
+        >
+          {is3DMode ? renderFlightPopupContent() : null}
         </div>
       </section>
     </main>

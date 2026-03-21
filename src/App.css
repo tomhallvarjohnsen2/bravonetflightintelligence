@@ -75,12 +75,11 @@
   justify-content: flex-end;
 }
 
-.flight-pill,
-.map-type-switcher {
+.map-type-switcher,
+.view-mode-switcher {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  height: 42px;
   padding: 6px 10px;
   border-radius: 12px;
   background: rgba(39, 41, 46, 0.9);
@@ -90,8 +89,8 @@
   box-sizing: border-box;
 }
 
-.flight-pill span,
-.map-type-switcher span {
+.map-type-switcher span,
+.view-mode-switcher span {
   font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -99,12 +98,13 @@
   color: #cbd5e1;
 }
 
-.flight-pill strong {
-  font-size: 1.05rem;
-  color: #f8fafc;
+.map-type-switcher,
+.view-mode-switcher {
+  height: 42px;
 }
 
-.map-type-switcher select {
+.map-type-switcher select,
+.view-mode-switcher select {
   min-width: 116px;
   height: 28px;
   padding: 0 10px;
@@ -121,6 +121,25 @@
   width: 100%;
   height: 100vh;
   background: #2b3038;
+}
+
+.map--hidden {
+  visibility: hidden;
+}
+
+.map--cesium {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+  visibility: hidden;
+}
+
+.map--cesium.is-active {
+  opacity: 1;
+  pointer-events: auto;
+  visibility: visible;
 }
 
 .flight-loader {
@@ -196,6 +215,13 @@
 
 .flight-popup.is-open {
   display: block;
+}
+
+.flight-popup--floating {
+  position: absolute;
+  z-index: 11;
+  pointer-events: auto;
+  transform: translate(0, -100%);
 }
 
 .flight-popup__close {
@@ -295,13 +321,17 @@
     width: fit-content;
   }
 
-  .flight-pill,
-  .map-type-switcher {
+  .map-type-switcher,
+  .view-mode-switcher {
     min-height: 44px;
   }
 
   .flight-popup {
     width: min(320px, calc(100vw - 28px));
+  }
+
+  .flight-popup--floating {
+    transform: none;
   }
 
   .flight-popup__row--route,
