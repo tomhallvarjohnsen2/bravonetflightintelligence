@@ -82,14 +82,49 @@ const REFRESH_INTERVAL_MS = 15000;
 const COMMERCIAL_CATEGORIES = new Set(["A2", "A3", "A4", "A5"]);
 const FLIGHT_ARROW_COLOR = "#f59e0b";
 const SELECTED_FLIGHT_ARROW_COLOR = "#fbbf24";
+const INITIAL_LOADER_MESSAGES = [
+  "Connecting to flight data source",
+  "Synchronizing live ADS-B positions",
+  "Filtering commercial traffic",
+  "Rendering aircraft on the map",
+  "Correlating transponder signals",
+  "Projecting live tracks into map coordinates",
+  "Indexing nearby aircraft movements",
+  "Finalizing the first tactical air picture",
+] as const;
+let primedFlightsPromise: Promise<Aircraft[]> | null = null;
 
-const createArrowIconDataUrl = (strokeColor: string, strokeWidth: number) => {
+const createPlaneIconDataUrl = (fillColor: string) => {
   const svg = `
     <svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 44 44">
-      <g fill="none" stroke="${strokeColor}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M22 35 L22 11" />
-        <path d="M14 19 L22 11 L30 19" />
-      </g>
+      <path
+        fill="${fillColor}"
+        d="M22 4
+           C20.8 4 19.9 4.9 19.9 6.1
+           V14.4
+           L10.8 19
+           C9.9 19.5 9.4 20.5 9.6 21.5
+           C9.8 22.6 10.8 23.4 11.9 23.4
+           H19.9
+           V28.1
+           L15.7 31.1
+           V35.2
+           L19.9 33.5
+           V38.3
+           C19.9 39.5 20.8 40.4 22 40.4
+           C23.2 40.4 24.1 39.5 24.1 38.3
+           V33.5
+           L28.3 35.2
+           V31.1
+           L24.1 28.1
+           V23.4
+           H32.1
+           C33.2 23.4 34.2 22.6 34.4 21.5
+           C34.6 20.5 34.1 19.5 33.2 19
+           L24.1 14.4
+           V6.1
+           C24.1 4.9 23.2 4 22 4Z"
+      />
     </svg>
   `;
 
@@ -106,7 +141,9 @@ function BravoNetLogo() {
         />
       </div>
       <div className="brand__text">
-        <span className="brand__tag">Air traffic intelligence</span>
+        <span className="brand__tag">
+          We know you are heading for Gran Canaria
+        </span>
       </div>
     </div>
   );
@@ -154,6 +191,26 @@ function isCommercialFlight(aircraft: Aircraft) {
   }
 
   return (aircraft.dbFlags ?? 0) & 1 ? false : true;
+}
+
+async function fetchCommercialFlights() {
+  const response = await fetch(FLIGHT_FEED_URL);
+
+  if (!response.ok) {
+    throw new Error(`Feed svarte med ${response.status}`);
+  }
+
+  const data = (await response.json()) as FlightFeedResponse;
+  return (data.ac ?? []).filter(isCommercialFlight);
+}
+
+function getPrimedFlightsPromise() {
+  primedFlightsPromise ??= fetchCommercialFlights();
+  return primedFlightsPromise;
+}
+
+if (typeof window !== "undefined") {
+  void getPrimedFlightsPromise();
 }
 
 function createFlightFeature(aircraft: Aircraft) {
@@ -223,6 +280,8 @@ function App() {
   const styleCacheRef = useRef(new globalThis.Map<string, Style[]>());
   const [flightCount, setFlightCount] = useState(0);
   const [mapType, setMapType] = useState<MapType>("dark");
+  const [isInitialFlightLoad, setIsInitialFlightLoad] = useState(true);
+  const [loaderMessageIndex, setLoaderMessageIndex] = useState(0);
   const [selectedFlight, setSelectedFlight] =
     useState<SelectedFlightDetails | null>(null);
   const [routeInfoState, setRouteInfoState] = useState<RouteInfoState>({
@@ -243,6 +302,24 @@ function App() {
     popupOverlayRef.current?.setPosition(selectedFlight?.position);
     flightsLayerRef.current?.changed();
   }, [selectedFlight]);
+
+  useEffect(() => {
+    if (!isInitialFlightLoad) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setLoaderMessageIndex((currentIndex) =>
+        currentIndex === INITIAL_LOADER_MESSAGES.length - 1
+          ? 0
+          : currentIndex + 1,
+      );
+    }, 1600);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [isInitialFlightLoad]);
 
   useEffect(() => {
     if (!selectedFlight) {
@@ -359,16 +436,16 @@ function App() {
           }
 
           const radians = (track * Math.PI) / 180;
-          const arrowStroke = isSelected
+          const aircraftColor = isSelected
             ? SELECTED_FLIGHT_ARROW_COLOR
             : FLIGHT_ARROW_COLOR;
-          const arrowStyle = new Style({
+          const aircraftStyle = new Style({
             image: new Icon({
-              src: createArrowIconDataUrl(arrowStroke, isSelected ? 3.8 : 3.2),
+              src: createPlaneIconDataUrl(aircraftColor),
               anchor: [0.5, 0.5],
               rotateWithView: true,
               rotation: radians,
-              scale: isSelected ? 1.12 : 1,
+              scale: isSelected ? 1.06 : 0.92,
             }),
           });
 
@@ -387,7 +464,7 @@ function App() {
             }),
           });
 
-          const styles = [arrowStyle, labelStyle];
+          const styles = [aircraftStyle, labelStyle];
           styleCacheRef.current.set(cacheKey, styles);
           return styles;
         },
@@ -467,7 +544,7 @@ function App() {
 
     let isCancelled = false;
 
-    const refreshFlights = async () => {
+    const refreshFlights = async (usePrimedFlights = false) => {
       if (isRefreshingRef.current) {
         return;
       }
@@ -475,14 +552,9 @@ function App() {
       isRefreshingRef.current = true;
 
       try {
-        const response = await fetch(FLIGHT_FEED_URL);
-
-        if (!response.ok) {
-          throw new Error(`Feed svarte med ${response.status}`);
-        }
-
-        const data = (await response.json()) as FlightFeedResponse;
-        const flights = (data.ac ?? []).filter(isCommercialFlight);
+        const flights = usePrimedFlights
+          ? await getPrimedFlightsPromise()
+          : await fetchCommercialFlights();
         const features = flights.map(createFlightFeature);
 
         if (isCancelled || !flightsSourceRef.current) {
@@ -522,15 +594,19 @@ function App() {
         }
 
         setFlightCount(features.length);
+        setIsInitialFlightLoad(false);
         flightsLayerRef.current?.changed();
       } catch {
         // Keep current map state when refresh fails instead of surfacing noisy fetch banners.
       } finally {
+        if (usePrimedFlights) {
+          primedFlightsPromise = null;
+        }
         isRefreshingRef.current = false;
       }
     };
 
-    void refreshFlights();
+    void refreshFlights(true);
     const intervalId = window.setInterval(() => {
       void refreshFlights();
     }, REFRESH_INTERVAL_MS);
@@ -575,6 +651,22 @@ function App() {
             </label>
           </div>
         </header>
+
+        {isInitialFlightLoad ? (
+          <div className="flight-loader" role="status" aria-live="polite">
+            <div className="flight-loader__panel">
+              <div className="flight-loader__spinner" aria-hidden="true" />
+              <p className="flight-loader__eyebrow">
+                BravoNET is starting up the engine...
+              </p>
+              <h2>{INITIAL_LOADER_MESSAGES[loaderMessageIndex]}</h2>
+              <p className="flight-loader__hint">
+                Validating telemetry, normalizing tracks, and preparing the
+                first aircraft layer.
+              </p>
+            </div>
+          </div>
+        ) : null}
 
         <div
           ref={mapElementRef}
