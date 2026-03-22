@@ -44,6 +44,13 @@ type FlightFeedResponse = {
 type RouteLookupResponse = {
   response?: {
     flightroute?: {
+      airline?: {
+        callsign?: string;
+        country?: string;
+        iata?: string;
+        icao?: string;
+        name?: string;
+      };
       destination?: {
         iata_code?: string;
         icao_code?: string;
@@ -60,7 +67,13 @@ type RouteLookupResponse = {
 
 type RouteInfoState =
   | { status: "idle" | "loading" }
-  | { destination: string; origin: string; status: "ready" }
+  | {
+      airline: string;
+      airlineLogoUrl: string | null;
+      destination: string;
+      origin: string;
+      status: "ready";
+    }
   | { message: string; status: "missing" | "error" };
 
 type SelectedFlightDetails = {
@@ -122,9 +135,7 @@ function BravoNetLogo() {
         />
       </div>
       <div className="brand__text">
-        <span className="brand__tag">
-          We know you are heading for Gran Canaria
-        </span>
+        <span className="brand__tag">BravoRadar 24</span>
       </div>
     </div>
   );
@@ -132,6 +143,23 @@ function BravoNetLogo() {
 
 function altitudeFeetToMeters(altitude: Aircraft["alt_baro"]) {
   return typeof altitude === "number" ? Math.max(0, altitude * 0.3048) : 0;
+}
+
+function getTrackRotationRadians(track: number) {
+  return (track * Math.PI) / 180;
+}
+
+function getCesiumBillboardRotationRadians(track: number) {
+  return -getTrackRotationRadians(track);
+}
+
+function createAirlineLogoUrl(iataCode?: string) {
+  const normalizedCode = iataCode?.trim().toUpperCase();
+  if (!normalizedCode) {
+    return null;
+  }
+
+  return `https://images.kiwi.com/airlines/64/${encodeURIComponent(normalizedCode)}.png`;
 }
 
 function createCesiumImageryProvider(mapType: MapType) {
@@ -367,6 +395,51 @@ function getRouteFieldValue(
   return "Unavailable";
 }
 
+function getAirlineFieldValue(routeInfoState: RouteInfoState) {
+  if (routeInfoState.status === "ready") {
+    return routeInfoState.airline;
+  }
+
+  if (routeInfoState.status === "loading") {
+    return "Loading...";
+  }
+
+  return "Unavailable";
+}
+
+function getAirlineLogoUrl(routeInfoState: RouteInfoState) {
+  if (routeInfoState.status === "ready") {
+    return routeInfoState.airlineLogoUrl;
+  }
+
+  return null;
+}
+
+type AirlineLogoProps = {
+  airline: string;
+  src: string | null;
+};
+
+function AirlineLogo({ airline, src }: AirlineLogoProps) {
+  const [hasLoadError, setHasLoadError] = useState(false);
+
+  if (!src || hasLoadError) {
+    return null;
+  }
+
+  return (
+    <img
+      className="flight-popup__airline-logo"
+      src={src}
+      alt={`${airline} logo`}
+      loading="lazy"
+      onError={() => {
+        setHasLoadError(true);
+      }}
+    />
+  );
+}
+
 function App() {
   const mapElementRef = useRef<HTMLDivElement | null>(null);
   const cesiumElementRef = useRef<HTMLDivElement | null>(null);
@@ -435,8 +508,16 @@ function App() {
         </button>
 
         <div className="flight-popup__header">
-          <h3>{selectedFlight.callsign}</h3>
-          <p>{selectedFlight.registration}</p>
+          <AirlineLogo
+            key={getAirlineLogoUrl(routeInfoState) ?? "no-airline-logo"}
+            airline={getAirlineFieldValue(routeInfoState)}
+            src={getAirlineLogoUrl(routeInfoState)}
+          />
+          <div className="flight-popup__header-copy">
+            <h3>{selectedFlight.callsign}</h3>
+            <p>{selectedFlight.registration}</p>
+            <p>{getAirlineFieldValue(routeInfoState)}</p>
+          </div>
         </div>
 
         <div className="flight-popup__details">
@@ -502,6 +583,7 @@ function App() {
       const altitudeMeters = altitudeFeetToMeters(aircraft.alt_baro);
       const callsign = aircraft.flight?.trim() ?? aircraft.hex;
       const track = aircraft.track ?? 0;
+      const billboardRotation = getCesiumBillboardRotationRadians(track);
       const isSelected = aircraft.hex === selectedHex;
       const aircraftEntityId = `flight-${aircraft.hex}`;
       const stemEntityId = `flight-stem-${aircraft.hex}`;
@@ -530,8 +612,11 @@ function App() {
           aircraftEntity.billboard.image = new Cesium.ConstantProperty(
             imageSource,
           );
+          aircraftEntity.billboard.alignedAxis = new Cesium.ConstantProperty(
+            Cesium.Cartesian3.UNIT_Z,
+          );
           aircraftEntity.billboard.rotation = new Cesium.ConstantProperty(
-            (track * Math.PI) / 180,
+            billboardRotation,
           );
           aircraftEntity.billboard.scale = new Cesium.ConstantProperty(
             isSelected ? 1.08 : 0.96,
@@ -548,9 +633,10 @@ function App() {
       } else {
         viewer.entities.add({
           billboard: {
+            alignedAxis: Cesium.Cartesian3.UNIT_Z,
             disableDepthTestDistance: Number.POSITIVE_INFINITY,
             image: imageSource,
-            rotation: (track * Math.PI) / 180,
+            rotation: billboardRotation,
             scale: isSelected ? 1.08 : 0.96,
             verticalOrigin: Cesium.VerticalOrigin.CENTER,
           },
@@ -688,6 +774,11 @@ function App() {
 
         const data = (await response.json()) as RouteLookupResponse;
         const route = data.response?.flightroute;
+        const airlineCode = route?.airline?.iata ?? route?.airline?.icao;
+        const airlineLabel = route?.airline?.name
+          ? `${airlineCode ? `${airlineCode} - ` : ""}${route.airline.name}`
+          : airlineCode;
+        const airlineLogoUrl = createAirlineLogoUrl(route?.airline?.iata);
         const originCode = route?.origin?.iata_code ?? route?.origin?.icao_code;
         const destinationCode =
           route?.destination?.iata_code ?? route?.destination?.icao_code;
@@ -698,7 +789,7 @@ function App() {
           ? `${destinationCode ? `${destinationCode} - ` : ""}${route.destination.name}`
           : destinationCode;
 
-        if (!originLabel && !destinationLabel) {
+        if (!airlineLabel && !originLabel && !destinationLabel) {
           setRouteInfoState({
             message: "Route information is unavailable for this flight.",
             status: "missing",
@@ -707,6 +798,8 @@ function App() {
         }
 
         setRouteInfoState({
+          airline: airlineLabel ?? "Unknown airline",
+          airlineLogoUrl,
           destination: destinationLabel ?? "Unknown destination",
           origin: originLabel ?? "Unknown origin",
           status: "ready",
@@ -763,7 +856,7 @@ function App() {
             return cachedStyle;
           }
 
-          const radians = (track * Math.PI) / 180;
+          const radians = getTrackRotationRadians(track);
           const aircraftColor = isSelected
             ? SELECTED_FLIGHT_ARROW_COLOR
             : FLIGHT_ARROW_COLOR;

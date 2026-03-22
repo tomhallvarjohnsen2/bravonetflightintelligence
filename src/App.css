@@ -239,10 +239,35 @@
   line-height: 1;
 }
 
+.flight-popup__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  margin-right: 28px;
+}
+
+.flight-popup__header-copy {
+  min-width: 0;
+}
+
+.flight-popup__airline-logo {
+  width: 52px;
+  height: 52px;
+  flex: 0 0 auto;
+  object-fit: contain;
+  border-radius: 10px;
+  padding: 6px;
+  background: rgba(248, 250, 252, 0.96);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  box-sizing: border-box;
+}
+
 .flight-popup__header h3 {
   margin: 2px 22px 2px 0;
   font-size: 1rem;
   line-height: 1.2;
+  word-break: break-word;
 }
 
 .flight-popup__header p {
@@ -337,6 +362,15 @@
   .flight-popup__row--route,
   .flight-popup__row--metrics {
     grid-template-columns: 1fr;
+  }
+
+  .flight-popup__header {
+    align-items: flex-start;
+  }
+
+  .flight-popup__airline-logo {
+    width: 44px;
+    height: 44px;
   }
 
   .flight-loader__panel {
