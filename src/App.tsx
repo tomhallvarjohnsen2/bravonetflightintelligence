@@ -1180,7 +1180,7 @@ function App() {
 
           <div className="topbar__controls">
             <label className="map-type-switcher">
-              <span>Map type</span>
+              <span>Basemap</span>
               <select
                 value={mapType}
                 onChange={(event) => {
